@@ -1,15 +1,16 @@
 import inspect
 from claybird.core.dependency_container import DependencyContainer
 from claybird.core.repositories.crud_repository_interface import CrudRepositoryInterface
+from claybird.managers.connection_manager import ConnectionManager
 
 class DependencyManager:
     @staticmethod
-    def inject(cls_to_inject, container: DependencyContainer):
-        instance = DependencyManager.instance_cls(cls_to_inject, container)
-        return DependencyManager.inject_attrs(instance, container)
+    async def inject(cls_to_inject, container: DependencyContainer):
+        instance = await DependencyManager.instance_cls(cls_to_inject, container)
+        return await DependencyManager.inject_attrs(instance, container)
 
     @staticmethod
-    def instance_cls(cls_to_instance, container: DependencyContainer):
+    async def instance_cls(cls_to_instance, container: DependencyContainer):
         if not inspect.isclass(cls_to_instance):
             return cls_to_instance
 
@@ -25,7 +26,9 @@ class DependencyManager:
                 continue
 
             if DependencyManager.is_repository(dep_type):
-                dep = DependencyManager.handle_repository(cls_to_instance ,param)
+                dep = await DependencyManager.handle_repository(cls_to_instance, param, container)
+                kwargs[name] = dep
+                continue
 
             if container.has(dep_type):
                 dep = container.get(dep_type)
@@ -34,16 +37,16 @@ class DependencyManager:
                     dep = dep()
 
                 elif inspect.isclass(dep):
-                    dep = DependencyManager.inject(dep, container)
+                    dep = await DependencyManager.inject(dep, container)
 
                 kwargs[name] = dep
             else:
-                kwargs[name] = DependencyManager.inject(dep_type, container)
+                kwargs[name] = await DependencyManager.inject(dep_type, container)
 
         return cls_to_instance(**kwargs)
 
     @staticmethod
-    def inject_attrs(instance_to_inject, container: DependencyContainer):
+    async def inject_attrs(instance_to_inject, container: DependencyContainer):
         annotations = getattr(instance_to_inject, "__annotations__", {})
 
         for attr_name, attr_type in annotations.items():
@@ -57,14 +60,14 @@ class DependencyManager:
                     dep = dep()
 
                 elif inspect.isclass(dep):
-                    dep = DependencyManager.inject(dep, container)
+                    dep = await DependencyManager.inject(dep, container)
 
                 setattr(instance_to_inject, attr_name, dep)
             else:
                 setattr(
                     instance_to_inject,
                     attr_name,
-                    DependencyManager.inject(attr_type, container)
+                    await DependencyManager.inject(attr_type, container)
                 )
 
         return instance_to_inject
@@ -74,6 +77,9 @@ class DependencyManager:
         return cls == CrudRepositoryInterface
 
     @staticmethod
-    def handle_repository(cls_to_instance ,param):
-        print(cls_to_instance)
-        print(param)
+    async def handle_repository(cls_to_instance, param, container: DependencyContainer):
+        if hasattr(cls_to_instance, "connection"):
+            connection_name = getattr(cls_to_instance, "connection")
+        else:
+            connection_name = "default"
+        return await ConnectionManager.get_engine_implementation(connection_name, param.annotation, container)

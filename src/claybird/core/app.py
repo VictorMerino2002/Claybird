@@ -25,7 +25,7 @@ class Claybird:
         
     async def _load_app(self):
         await ConnectionManager.load_connection_from_settings(self.container)
-        ControllerManager.load_controllers(self.container)
+        await ControllerManager.load_controllers(self.container)
         await EventManager.emit("start")
 
     async def run(self):
