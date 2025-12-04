@@ -38,6 +38,9 @@ class CrudRepository(CrudRepositoryInterface, Generic[T]):
     async def get_all(self):
         return await self.impl.get_all()
 
+    async def save_batch(self):
+        return await self.impl.save_batch()
+
     def __getattr__(self, name):
         attr = getattr(self.impl, name)
 

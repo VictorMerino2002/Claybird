@@ -22,7 +22,6 @@ class MysqlCrudRepository(CrudRepositoryInterface):
 
     @EventManager.on_event("start")
     async def _lazy_init(self):
-
         if not self.table_name:
             self.table_name = camel_to_snake(self.entity_cls.__name__)
         if not await self.table_exists():
@@ -83,7 +82,6 @@ class MysqlCrudRepository(CrudRepositoryInterface):
                 await cursor.execute(query)
                 await conn.commit()
 
-
     async def table_exists(self) -> bool:
         query = """
             SELECT COUNT(*)
@@ -111,6 +109,33 @@ class MysqlCrudRepository(CrudRepositoryInterface):
         query = (
             f"INSERT INTO `{self.table_name}` ({columns}) "
             f"VALUES ({placeholders}) "
+            f"ON DUPLICATE KEY UPDATE {update_clause}"
+        )
+
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(query, values)
+        
+    async def save_batch(self, entities: list[Entity]):
+        if not entities:
+            return
+
+        pk = self.entity_cls.get_primary_key()
+        keys = entities[0].get_keys()
+        columns = ", ".join(f"`{k}`" for k in keys)
+
+        placeholders = ", ".join(["%s"] * len(keys))
+
+        value_groups = ", ".join(f"({placeholders})" for _ in entities)
+
+        values = [value for e in entities for value in e.get_values()]
+
+        update_keys = [k for k in keys if k != pk]
+        update_clause = ", ".join(f"`{k}` = VALUES(`{k}`)" for k in update_keys)
+
+        query = (
+            f"INSERT INTO `{self.table_name}` ({columns}) "
+            f"VALUES {value_groups} "
             f"ON DUPLICATE KEY UPDATE {update_clause}"
         )
 
@@ -145,3 +170,130 @@ class MysqlCrudRepository(CrudRepositoryInterface):
                 await cursor.execute(query)
                 entities = await cursor.fetchall()
         return [self.entity_cls(**e) for e in entities]
+
+    def __getattr__(self, name):
+        """
+        Crea métodos dinámicos tipo Spring Data JPA:
+        find_by_field, find_by_field1_and_field2, delete_by_field, etc.
+        """
+        patterns = [
+            ("find_by_", "find"),
+            ("get_by_", "find"),
+            ("count_by_", "count"),
+            ("delete_by_", "delete"),
+        ]
+
+        for prefix, action in patterns:
+            if name.startswith(prefix):
+                query_fields = name[len(prefix):]
+                return self._build_dynamic_method(action, query_fields)
+
+        raise AttributeError(f"'{self.__class__.__name__}' has no attribute '{name}'")
+
+
+    def _build_dynamic_method(self, action, query_fields_raw):
+        import re
+
+        parts = re.split(r"_and_|_or_", query_fields_raw)
+        connectors = re.findall(r"_and_|_or_", query_fields_raw)
+
+        conditions = []
+
+        for part in parts:
+            op = "="
+
+            if part.endswith("_less_than"):
+                field = part[:-11]
+                op = "<"
+
+            elif part.endswith("_greater_than"):
+                field = part[:-14]
+                op = ">"
+
+            elif part.endswith("_before"):
+                field = part[:-7]
+                op = "<"
+
+            elif part.endswith("_after"):
+                field = part[:-6]
+                op = ">"
+
+            elif part.endswith("_like"):
+                field = part[:-5]
+                op = "LIKE"
+
+            elif part.endswith("_not_like"):
+                field = part[:-9]
+                op = "NOT LIKE"
+
+            elif part.endswith("_starts_with"):
+                field = part[:-13]
+                op = "LIKE_START"
+
+            elif part.endswith("_ends_with"):
+                field = part[:-11]
+                op = "LIKE_END"
+
+            else:
+                field = part
+
+            conditions.append((field, op))
+
+        async def method(*values):
+            if len(values) != len(conditions):
+                raise ValueError("Argument count does not match dynamic query definition")
+
+            where_clauses = []
+            params = []
+
+            for (field, op), value in zip(conditions, values):
+
+                if op == "LIKE":
+                    where_clauses.append(f"`{field}` LIKE %s")
+                    params.append(f"%{value}%")
+
+                elif op == "NOT LIKE":
+                    where_clauses.append(f"`{field}` NOT LIKE %s")
+                    params.append(f"%{value}%")
+
+                elif op == "LIKE_START":
+                    where_clauses.append(f"`{field}` LIKE %s")
+                    params.append(f"{value}%")
+
+                elif op == "LIKE_END":
+                    where_clauses.append(f"`{field}` LIKE %s")
+                    params.append(f"%{value}")
+
+                else:
+                    where_clauses.append(f"`{field}` {op} %s")
+                    params.append(value)
+
+            sql_where = where_clauses[0]
+            for cond, conn in zip(where_clauses[1:], connectors):
+                sql_where += f" {'AND' if '_and_' in conn else 'OR'} {cond}"
+
+            if action == "find":
+                sql = f"SELECT * FROM `{self.table_name}` WHERE {sql_where}"
+
+            elif action == "count":
+                sql = f"SELECT COUNT(*) AS count FROM `{self.table_name}` WHERE {sql_where}"
+
+            elif action == "delete":
+                sql = f"DELETE FROM `{self.table_name}` WHERE {sql_where}"
+
+            async with self.pool.acquire() as conn:
+                async with conn.cursor(DictCursor) as cursor:
+                    await cursor.execute(sql, params)
+
+                    if action == "find":
+                        rows = await cursor.fetchall()
+                        return [self.entity_cls(**r) for r in rows]
+
+                    if action == "count":
+                        result = await cursor.fetchone()
+                        return result["count"]
+
+                    if action == "delete":
+                        return cursor.rowcount
+
+        return method

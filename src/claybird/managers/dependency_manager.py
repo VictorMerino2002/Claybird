@@ -17,31 +17,31 @@ class DependencyManager:
         sig = inspect.signature(cls_to_instance.__init__)
         kwargs = {}
 
-        for name, param in sig.parameters.items():
-            if name == "self":
+        for param_name, param in sig.parameters.items():
+            if param_name == "self":
                 continue
 
-            dep_type = param.annotation
-            if dep_type is inspect.Parameter.empty:
+            param_type = param.annotation
+            if param_type is inspect.Parameter.empty:
                 continue
 
-            if DependencyManager.is_repository(dep_type):
-                dep = await DependencyManager.handle_repository(cls_to_instance, param, container)
-                kwargs[name] = dep
+            if DependencyManager.is_repository(param_type):
+                implementation = await DependencyManager.handle_repository(cls_to_instance, param, container)
+                kwargs[param_name] = implementation
                 continue
 
-            if container.has(dep_type):
-                dep = container.get(dep_type)
+            if container.has(param_type):
+                implementation = container.get(param_type)
 
-                if callable(dep) and not inspect.isclass(dep):
-                    dep = dep()
+                if callable(implementation) and not inspect.isclass(implementation):
+                    implementation = implementation()
 
-                elif inspect.isclass(dep):
-                    dep = await DependencyManager.inject(dep, container)
+                elif inspect.isclass(implementation):
+                    implementation = await DependencyManager.inject(implementation, container)
 
-                kwargs[name] = dep
+                kwargs[param_name] = implementation
             else:
-                kwargs[name] = await DependencyManager.inject(dep_type, container)
+                kwargs[param_name] = await DependencyManager.inject(param_type, container)
 
         return cls_to_instance(**kwargs)
 

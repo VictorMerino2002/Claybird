@@ -20,3 +20,7 @@ class CrudRepositoryInterface(ABC, Generic[T]):
     @abstractmethod
     async def get_all(self):
         pass
+
+    @abstractmethod
+    async def save_batch(self, entities):
+        pass
