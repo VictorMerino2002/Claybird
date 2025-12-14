@@ -1,11 +1,12 @@
 import inspect
 from claybird.core.models.field_type import FieldType
+from uuid import UUID
 
 class Field:
     __slots__ = ("type_", "required", "default", "primary_key", "name")
 
-    def __init__(self, *, type=str, required=False, default=None, primary_key=False):
-        self.type_ = type
+    def __init__(self, *, type_=str, required=False, default=None, primary_key=False):
+        self.type_ = type_
         self.required = required
         self.default = default
         self.primary_key = primary_key
@@ -49,6 +50,9 @@ class Field:
             expected_type = self.type_.type_
         else:
             expected_type = self.type_
+
+        if expected_type is UUID and isinstance(value, str):
+            value = UUID(value)
 
         if not isinstance(value, expected_type):
             raise TypeError(

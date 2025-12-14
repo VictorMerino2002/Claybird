@@ -1,55 +1,102 @@
-from claybird.core.repositories.crud_repository_interface import CrudRepositoryInterface
+from __future__ import annotations
+
+import datetime
+import uuid
+import decimal
+import re
+from enum import Enum
+from dataclasses import is_dataclass
+from typing import Any, Iterable
+
 from aiomysql.pool import Pool
 from aiomysql import DictCursor
+from pydantic import BaseModel
+from dataclasses import is_dataclass, Field as DataclassField
+
+from claybird.core.repositories.crud_repository_interface import CrudRepositoryInterface
 from claybird.managers.event_manager import EventManager
 from claybird.core.models.entity import Entity
 from claybird.core.models.fields import Field
 from claybird.core.models import field_type
-import datetime
-import uuid
-import decimal
 from claybird.utils.text_formatter import camel_to_snake
+from claybird.core.models.field_utilities import FieldUtilities
+
 
 class MysqlCrudRepository(CrudRepositoryInterface):
+    table_name: str | None = None
+    schema: str | None = None
+    entity_cls: type[Entity]
 
-    table_name: str = None
-    schema: str = None
-    entity_cls: Entity
+    _TYPE_MAP = {
+        str: "VARCHAR(255)",
+        field_type.TEXT: "LONGTEXT",
+        int: "INT",
+        float: "FLOAT",
+        bool: "BOOL",
+        bytes: "BLOB",
+        datetime.datetime: "DATETIME",
+        datetime.date: "DATE",
+        uuid.UUID: "CHAR(36)",
+        decimal.Decimal: "DECIMAL(20,6)",
+    }
 
     def __init__(self, pool: Pool):
         self.pool = pool
-        self.schema = self.pool._conn_kwargs.get("db")
+        self.schema = pool._conn_kwargs.get("db")
 
     @EventManager.on_event("start")
     async def _lazy_init(self):
-        if not self.table_name:
-            self.table_name = camel_to_snake(self.entity_cls.__name__)
+        self.table_name = self.table_name or camel_to_snake(self.entity_cls.__name__)
         if not await self.table_exists():
             await self.create_table()
 
-    def get_column_from_field(self, name: str, field: Field) -> str:
-        python_type = field.type_
+    async def create_table(self):
+        columns = self._build_columns(self.entity_cls.get_fields())
+        query = f"""
+            CREATE TABLE `{self.table_name}` (
+                {", ".join(columns)}
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """
 
-        TYPE_MAP = {
-            str: "VARCHAR(255)",
-            field_type.TEXT: "LONGTEXT",
-            int: "INT",
-            float: "FLOAT",
-            bool: "BOOL",
-            bytes: "BLOB",
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cursor:
+                await cursor.execute(query)
+                await conn.commit()
 
-            datetime.datetime: "DATETIME",
-            datetime.date: "DATE",
-            uuid.UUID: "CHAR(36)",
-            decimal.Decimal: "DECIMAL(20,6)",
-        }
+    def _build_columns(self, fields: dict[str, Field]) -> list[str]:
+        columns: list[str] = []
 
-        if isinstance(python_type, type) and issubclass(python_type, enum.Enum):
-            enum_values = "', '".join([e.value for e in python_type])  
-            column_type = f"ENUM('{enum_values}')"
-        else:
-            column_type = TYPE_MAP.get(python_type, "VARCHAR(255)")
+        for name, field in fields.items():
+            if FieldUtilities.is_embedded_type(field.type_):
+                columns.extend(self._build_embedded_columns(name, field.type_))
+            else:
+                columns.append(self._column_sql(name, field))
 
+        return columns
+
+    def _build_embedded_columns(self, prefix: str, type_: type) -> list[str]:
+        embedded_fields = FieldUtilities.get_embedded_fields(type_)
+        columns = []
+
+        for sub_name, sub_field in embedded_fields.items():
+
+            if isinstance(sub_field, Field):
+                field = sub_field
+
+            elif isinstance(sub_field, DataclassField):
+                field = Field(type_=sub_field.type)
+
+            else:
+                field = Field(type_=sub_field.annotation)
+
+            columns.append(
+                self._column_sql(f"{prefix}_{sub_name}", field)
+            )
+
+        return columns
+
+    def _column_sql(self, name: str, field: Field) -> str:
+        column_type = self._resolve_column_type(field.type_)
         parts = [f"`{name}` {column_type}"]
 
         if field.primary_key:
@@ -58,29 +105,18 @@ class MysqlCrudRepository(CrudRepositoryInterface):
         if field.required:
             parts.append("NOT NULL")
 
-        if field.default is not None:
+        if field.default is not None and not callable(field.default):
             default = str(field.default).replace("'", "''")
             parts.append(f"DEFAULT '{default}'")
 
         return " ".join(parts)
 
-    async def create_table(self):
-        fields = self.entity_cls.get_fields()
-        columns = []
+    def _resolve_column_type(self, python_type: type) -> str:
+        if isinstance(python_type, type) and issubclass(python_type, Enum):
+            values = "', '".join(e.value for e in python_type)
+            return f"ENUM('{values}')"
 
-        for name, field in fields.items():
-            columns.append(self.get_column_from_field(name, field))
-
-        query = f"""
-            CREATE TABLE `{self.table_name}` (
-                {",".join(columns)}
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-        """
-
-        async with self.pool.acquire() as conn:
-            async with conn.cursor() as cursor:
-                await cursor.execute(query)
-                await conn.commit()
+        return self._TYPE_MAP.get(python_type, "VARCHAR(255)")
 
     async def table_exists(self) -> bool:
         query = """
@@ -93,207 +129,177 @@ class MysqlCrudRepository(CrudRepositoryInterface):
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute(query, (self.schema, self.table_name))
-                (result,) = await cursor.fetchone()
+                (count,) = await cursor.fetchone()
 
-        return result >= 1
+        return count > 0
 
     async def save(self, entity: Entity):
-        keys = entity.get_keys()
-        values = entity.get_values()
+        keys = FieldUtilities.flatten_entity_keys(entity)
+        values = FieldUtilities.flatten_entity_values(entity)
 
         columns = ", ".join(f"`{k}`" for k in keys)
-        placeholders = ", ".join(["%s"] * len(keys))
+        placeholders = ", ".join("%s" for _ in keys)
+        updates = ", ".join(f"`{k}` = VALUES(`{k}`)" for k in keys)
 
-        update_clause = ", ".join(f"`{k}` = VALUES(`{k}`)" for k in keys)
-
-        query = (
-            f"INSERT INTO `{self.table_name}` ({columns}) "
-            f"VALUES ({placeholders}) "
-            f"ON DUPLICATE KEY UPDATE {update_clause}"
-        )
+        query = f"""
+            INSERT INTO `{self.table_name}` ({columns})
+            VALUES ({placeholders})
+            ON DUPLICATE KEY UPDATE {updates}
+        """
 
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute(query, values)
-        
+
     async def save_batch(self, entities: list[Entity]):
         if not entities:
             return
 
-        pk = self.entity_cls.get_primary_key()
         keys = entities[0].get_keys()
+        pk = self.entity_cls.get_primary_key()
+
         columns = ", ".join(f"`{k}`" for k in keys)
+        placeholders = "(" + ", ".join("%s" for _ in keys) + ")"
+        values_sql = ", ".join(placeholders for _ in entities)
 
-        placeholders = ", ".join(["%s"] * len(keys))
+        values = [v for e in entities for v in e.get_values()]
+        updates = ", ".join(f"`{k}` = VALUES(`{k}`)" for k in keys if k != pk)
 
-        value_groups = ", ".join(f"({placeholders})" for _ in entities)
-
-        values = [value for e in entities for value in e.get_values()]
-
-        update_keys = [k for k in keys if k != pk]
-        update_clause = ", ".join(f"`{k}` = VALUES(`{k}`)" for k in update_keys)
-
-        query = (
-            f"INSERT INTO `{self.table_name}` ({columns}) "
-            f"VALUES {value_groups} "
-            f"ON DUPLICATE KEY UPDATE {update_clause}"
-        )
+        query = f"""
+            INSERT INTO `{self.table_name}` ({columns})
+            VALUES {values_sql}
+            ON DUPLICATE KEY UPDATE {updates}
+        """
 
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cursor:
                 await cursor.execute(query, values)
 
-    async def get(self, id):
+    async def get(self, id_: Any):
         pk = self.entity_cls.get_primary_key()
-        query = f"SELECT * FROM {self.table_name} WHERE {pk} = %s"
+        query = f"SELECT * FROM `{self.table_name}` WHERE `{pk}` = %s"
 
         async with self.pool.acquire() as conn:
             async with conn.cursor(DictCursor) as cursor:
-                await cursor.execute(query, (id, ))
-                entity = await cursor.fetchone()
-        if entity is None: return None
-        return self.entity_cls(**entity)
+                await cursor.execute(query, (id_,))
+                row = await cursor.fetchone()
 
-    async def delete(self, id):
+        data = FieldUtilities.inflate_embedded_fields(self.entity_cls, row)
+        return self.entity_cls(**data)
+
+    async def delete(self, id_: Any):
         pk = self.entity_cls.get_primary_key()
-        query = f"DELETE FROM {self.table_name} WHERE {pk} = %s"
+        query = f"DELETE FROM `{self.table_name}` WHERE `{pk}` = %s"
 
         async with self.pool.acquire() as conn:
             async with conn.cursor() as cursor:
-                await cursor.execute(query, (id, ))
+                await cursor.execute(query, (id_,))
 
     async def get_all(self):
-        query = f"SELECT * FROM {self.table_name}"
+        query = f"SELECT * FROM `{self.table_name}`"
 
         async with self.pool.acquire() as conn:
             async with conn.cursor(DictCursor) as cursor:
                 await cursor.execute(query)
-                entities = await cursor.fetchall()
-        return [self.entity_cls(**e) for e in entities]
+                rows = await cursor.fetchall()
 
-    def __getattr__(self, name):
-        """
-        Crea métodos dinámicos tipo Spring Data JPA:
-        find_by_field, find_by_field1_and_field2, delete_by_field, etc.
-        """
-        patterns = [
-            ("find_by_", "find"),
-            ("get_by_", "find"),
-            ("count_by_", "count"),
-            ("delete_by_", "delete"),
-        ]
+        entities = []
+        for row in rows:
+            data = FieldUtilities.inflate_embedded_fields(self.entity_cls, row)
+            entities.append(self.entity_cls(**data))
+        return entities
 
-        for prefix, action in patterns:
+    def __getattr__(self, name: str):
+        prefixes = {
+            "find_by_": "find",
+            "get_by_": "find",
+            "count_by_": "count",
+            "delete_by_": "delete",
+        }
+
+        for prefix, action in prefixes.items():
             if name.startswith(prefix):
-                query_fields = name[len(prefix):]
-                return self._build_dynamic_method(action, query_fields)
+                return self._build_dynamic_method(action, name[len(prefix):])
 
-        raise AttributeError(f"'{self.__class__.__name__}' has no attribute '{name}'")
+        raise AttributeError(f"{self.__class__.__name__} has no attribute {name}")
 
+    def _build_dynamic_method(self, action: str, raw_fields: str):
+        parts = re.split(r"_and_|_or_", raw_fields)
+        connectors = re.findall(r"_and_|_or_", raw_fields)
 
-    def _build_dynamic_method(self, action, query_fields_raw):
-        import re
-
-        parts = re.split(r"_and_|_or_", query_fields_raw)
-        connectors = re.findall(r"_and_|_or_", query_fields_raw)
-
-        conditions = []
-
-        for part in parts:
-            op = "="
-
-            if part.endswith("_less_than"):
-                field = part[:-11]
-                op = "<"
-
-            elif part.endswith("_greater_than"):
-                field = part[:-14]
-                op = ">"
-
-            elif part.endswith("_before"):
-                field = part[:-7]
-                op = "<"
-
-            elif part.endswith("_after"):
-                field = part[:-6]
-                op = ">"
-
-            elif part.endswith("_like"):
-                field = part[:-5]
-                op = "LIKE"
-
-            elif part.endswith("_not_like"):
-                field = part[:-9]
-                op = "NOT LIKE"
-
-            elif part.endswith("_starts_with"):
-                field = part[:-13]
-                op = "LIKE_START"
-
-            elif part.endswith("_ends_with"):
-                field = part[:-11]
-                op = "LIKE_END"
-
-            else:
-                field = part
-
-            conditions.append((field, op))
+        conditions = [self._parse_condition(p) for p in parts]
 
         async def method(*values):
             if len(values) != len(conditions):
-                raise ValueError("Argument count does not match dynamic query definition")
+                raise ValueError("Invalid argument count")
 
-            where_clauses = []
-            params = []
-
-            for (field, op), value in zip(conditions, values):
-
-                if op == "LIKE":
-                    where_clauses.append(f"`{field}` LIKE %s")
-                    params.append(f"%{value}%")
-
-                elif op == "NOT LIKE":
-                    where_clauses.append(f"`{field}` NOT LIKE %s")
-                    params.append(f"%{value}%")
-
-                elif op == "LIKE_START":
-                    where_clauses.append(f"`{field}` LIKE %s")
-                    params.append(f"{value}%")
-
-                elif op == "LIKE_END":
-                    where_clauses.append(f"`{field}` LIKE %s")
-                    params.append(f"%{value}")
-
-                else:
-                    where_clauses.append(f"`{field}` {op} %s")
-                    params.append(value)
-
-            sql_where = where_clauses[0]
-            for cond, conn in zip(where_clauses[1:], connectors):
-                sql_where += f" {'AND' if '_and_' in conn else 'OR'} {cond}"
-
-            if action == "find":
-                sql = f"SELECT * FROM `{self.table_name}` WHERE {sql_where}"
-
-            elif action == "count":
-                sql = f"SELECT COUNT(*) AS count FROM `{self.table_name}` WHERE {sql_where}"
-
-            elif action == "delete":
-                sql = f"DELETE FROM `{self.table_name}` WHERE {sql_where}"
+            where, params = self._build_where(conditions, connectors, values)
+            sql = self._build_action_sql(action, where)
 
             async with self.pool.acquire() as conn:
                 async with conn.cursor(DictCursor) as cursor:
                     await cursor.execute(sql, params)
 
                     if action == "find":
-                        rows = await cursor.fetchall()
-                        return [self.entity_cls(**r) for r in rows]
-
+                        return [self.entity_cls(**r) for r in await cursor.fetchall()]
                     if action == "count":
-                        result = await cursor.fetchone()
-                        return result["count"]
-
+                        return (await cursor.fetchone())["count"]
                     if action == "delete":
                         return cursor.rowcount
 
         return method
+
+    @staticmethod
+    def _parse_condition(part: str) -> tuple[str, str]:
+        rules = {
+            "_less_than": "<",
+            "_greater_than": ">",
+            "_before": "<",
+            "_after": ">",
+            "_like": "LIKE",
+            "_not_like": "NOT LIKE",
+            "_starts_with": "LIKE_START",
+            "_ends_with": "LIKE_END",
+        }
+
+        for suffix, op in rules.items():
+            if part.endswith(suffix):
+                return part[:-len(suffix)], op
+
+        return part, "="
+
+    @staticmethod
+    def _build_where(conditions, connectors, values):
+        clauses, params = [], []
+
+        for (field, op), value in zip(conditions, values):
+            if op == "LIKE":
+                clauses.append(f"`{field}` LIKE %s")
+                params.append(f"%{value}%")
+            elif op == "NOT LIKE":
+                clauses.append(f"`{field}` NOT LIKE %s")
+                params.append(f"%{value}%")
+            elif op == "LIKE_START":
+                clauses.append(f"`{field}` LIKE %s")
+                params.append(f"{value}%")
+            elif op == "LIKE_END":
+                clauses.append(f"`{field}` LIKE %s")
+                params.append(f"%{value}")
+            else:
+                clauses.append(f"`{field}` {op} %s")
+                params.append(value)
+
+        sql = clauses[0]
+        for clause, conn in zip(clauses[1:], connectors):
+            sql += f" {'AND' if '_and_' in conn else 'OR'} {clause}"
+
+        return sql, params
+
+    def _build_action_sql(self, action: str, where: str) -> str:
+        if action == "find":
+            return f"SELECT * FROM `{self.table_name}` WHERE {where}"
+        if action == "count":
+            return f"SELECT COUNT(*) AS count FROM `{self.table_name}` WHERE {where}"
+        if action == "delete":
+            return f"DELETE FROM `{self.table_name}` WHERE {where}"
+        raise ValueError(f"Unknown action {action}")
